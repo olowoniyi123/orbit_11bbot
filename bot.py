@@ -1,180 +1,294 @@
 import os
+import re
 import logging
 import feedparser
-from datetime import datetime, timezone
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 from telegram.constants import ParseMode
 
 # --- Configuration ---
-# Read from Railway environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")  # Your channel ID (e.g., -1001234567890)
 
 # RSS Feeds for Phone News
 FEEDS = [
     "https://www.gsmarena.com/rss-news-reviews.php3",
-    "https://www.phonearena.com/feed"
+    "https://www.phonearena.com/feed",
 ]
 
-# File to track seen posts (persisted in Railway's ephemeral storage)
+# Files (Railway persistent via volume recommended; otherwise ephemeral)
+SUBSCRIBERS_FILE = "subscribers.txt"
 SEEN_FILE = "seen_news.txt"
 
-# Enable logging
+# How often to push updates to each user (in seconds)
+UPDATE_INTERVAL = 3600  # 1 hour
+
+# Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 
-def load_seen():
-    """Load previously seen article URLs."""
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r") as f:
-            return set(line.strip() for line in f)
+# ---------- Persistence helpers ----------
+def load_set(filepath):
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            return set(line.strip() for line in f if line.strip())
     return set()
 
 
-def save_seen(seen_set):
-    """Save seen URLs to file."""
-    with open(SEEN_FILE, "w") as f:
-        for url in seen_set:
-            f.write(url + "\n")
+def save_set(filepath, data_set):
+    with open(filepath, "w") as f:
+        for item in data_set:
+            f.write(item + "\n")
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /start command."""
-    welcome_text = (
-        "📱 *Phone Update Bot*\n\n"
-        "I provide the latest phone news and leaks automatically.\n\n"
-        "*Commands:*\n"
-        "/start - Show this message\n"
-        "/latest - Get the latest phone news immediately\n"
-        "/help - How to use this bot\n\n"
-        "I'm active 24/7 and push updates whenever new phone news breaks!"
-    )
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+def load_subscribers():
+    return load_set(SUBSCRIBERS_FILE)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /help command."""
-    help_text = (
-        "🔧 *Help*\n\n"
-        "This bot monitors reputable sources (GSMArena, PhoneArena) for new phone releases and rumors.\n\n"
-        "• Use /latest to manually check for updates.\n"
-        "• The bot automatically posts to the channel when new content is available.\n"
-        "• No spam, only real phone news."
-    )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+def save_subscribers(subs):
+    save_set(SUBSCRIBERS_FILE, subs)
 
 
-async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /latest command - fetches news on demand."""
-    await update.message.reply_text("🔍 Checking for the latest phone news...")
-    await check_and_send(context.bot, force_send=True)
+def load_seen():
+    return load_set(SEEN_FILE)
 
 
-async def check_and_send(bot, force_send=False):
-    """Fetch feeds and send new items to the channel."""
-    if not CHAT_ID:
-        logger.warning("CHAT_ID not set. Skipping channel post.")
-        return 0
+def save_seen(seen):
+    save_set(SEEN_FILE, seen)
 
-    seen = load_seen()
+
+# ---------- News fetcher ----------
+def clean_html(text):
+    """Remove HTML tags and trim."""
+    text = re.sub("<[^<]+?>", "", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:250] + "..." if len(text) > 250 else text
+
+
+def fetch_new_news(seen, limit=3):
+    """Fetch new phone news not yet seen."""
     new_items = []
-
     for feed_url in FEEDS:
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:5]:  # Check top 5 from each feed
+            for entry in feed.entries[:10]:
                 url = entry.link
-                if url not in seen or force_send:
-                    # Clean up summary
-                    summary = getattr(entry, "summary", "No summary available.")
-                    # Remove HTML tags roughly for Telegram
-                    import re
-                    summary = re.sub('<[^<]+?>', '', summary)
-                    summary = summary[:200] + "..." if len(summary) > 200 else summary
-
-                    new_items.append({
+                if url in seen:
+                    continue
+                new_items.append(
+                    {
                         "title": entry.title,
                         "link": url,
-                        "summary": summary,
-                        "published": getattr(entry, "published", "")
-                    })
+                        "summary": clean_html(getattr(entry, "summary", "")),
+                    }
+                )
         except Exception as e:
             logger.error(f"Error parsing feed {feed_url}: {e}")
+    return new_items[:limit]
 
-    # Send new items (limit to avoid flooding)
-    sent_count = 0
-    for item in new_items[:3]:
+
+def build_message(item):
+    return (
+        f"📱 *{item['title']}*\n\n"
+        f"{item['summary']}\n\n"
+        f"🔗 [Read full article]({item['link']})"
+    )
+
+
+# ---------- Command handlers ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    subscribers = load_subscribers()
+
+    first_time = user_id not in subscribers
+    if first_time:
+        subscribers.add(user_id)
+        save_subscribers(subscribers)
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📲 Latest News Now", callback_data="latest"),
+            InlineKeyboardButton("❌ Stop Updates", callback_data="stop"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if first_time:
         text = (
-            f"📱 *{item['title']}*\n\n"
-            f"{item['summary']}\n\n"
-            f"🔗 [Read more]({item['link']})"
+            "👋 *Welcome to Phone Update Bot!*\n\n"
+            "You're now subscribed. I'll send you the latest phone launches, "
+            "leaks, and features automatically — right here in this chat.\n\n"
+            "Use the buttons below anytime."
         )
-        try:
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=False
-            )
-            seen.add(item['link'])
-            sent_count += 1
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}")
+    else:
+        text = (
+            "✅ You're already subscribed.\n\n"
+            "I'll keep sending you the latest phone news automatically."
+        )
 
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🔧 *Help*\n\n"
+        "*Commands:*\n"
+        "/start – Subscribe and get the welcome message\n"
+        "/latest – Fetch the latest phone news right now\n"
+        "/stop – Unsubscribe from automatic updates\n"
+        "/help – Show this message\n\n"
+        "Once you start the bot, you'll automatically receive new phone "
+        "launches, leaks, and reviews every hour."
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Fetching the latest phone news...")
+    seen = load_seen()
+    items = fetch_new_news(seen, limit=3)
+    if not items:
+        await update.message.reply_text(
+            "😕 No new phone news right now. Try again later."
+        )
+        return
+    for item in items:
+        await update.message.reply_text(
+            build_message(item),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=False,
+        )
+        seen.add(item["link"])
     save_seen(seen)
-    logger.info(f"Sent {sent_count} new items.")
-    return len(new_items)
 
 
-async def scheduled_check(context: ContextTypes.DEFAULT_TYPE):
-    """Callback for the scheduled job."""
-    logger.info("Running scheduled news check...")
-    await check_and_send(context.bot)
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    subscribers = load_subscribers()
+    if user_id in subscribers:
+        subscribers.discard(user_id)
+        save_subscribers(subscribers)
+        await update.message.reply_text(
+            "🛑 You've been unsubscribed. Send /start anytime to resubscribe."
+        )
+    else:
+        await update.message.reply_text(
+            "You're not currently subscribed. Send /start to subscribe."
+        )
 
 
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "latest":
+        seen = load_seen()
+        items = fetch_new_news(seen, limit=3)
+        if not items:
+            await query.message.reply_text("😕 No new phone news right now.")
+            return
+        for item in items:
+            await query.message.reply_text(
+                build_message(item),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=False,
+            )
+            seen.add(item["link"])
+        save_seen(seen)
+    elif query.data == "stop":
+        user_id = str(query.from_user.id)
+        subscribers = load_subscribers()
+        subscribers.discard(user_id)
+        save_subscribers(subscribers)
+        await query.message.reply_text(
+            "🛑 You've been unsubscribed. Send /start to resubscribe."
+        )
+
+
+# ---------- Scheduled broadcast ----------
+async def broadcast_updates(context: ContextTypes.DEFAULT_TYPE):
+    """Send new phone news to every subscriber."""
+    subscribers = load_subscribers()
+    if not subscribers:
+        logger.info("No subscribers yet.")
+        return
+
+    seen = load_seen()
+    items = fetch_new_news(seen, limit=3)
+    if not items:
+        logger.info("No new items to broadcast.")
+        return
+
+    sent = 0
+    for user_id in list(subscribers):
+        for item in items:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=build_message(item),
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=False,
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Failed to send to {user_id}: {e}")
+                # If user blocked the bot, remove them
+                if "blocked" in str(e).lower() or "chat not found" in str(e).lower():
+                    subscribers.discard(user_id)
+                    save_subscribers(subscribers)
+        # Mark items as seen after sending to all
+    for item in items:
+        seen.add(item["link"])
+    save_seen(seen)
+    logger.info(f"Broadcast complete. Sent {sent} messages to {len(subscribers)} users.")
+
+
+# ---------- Post init: set commands + schedule ----------
 async def post_init(application: Application):
-    """Set bot commands menu and schedule the recurring job."""
     commands = [
-        BotCommand("start", "Start the bot"),
-        BotCommand("latest", "Get latest phone news now"),
-        BotCommand("help", "How to use this bot")
+        BotCommand("start", "Subscribe to phone updates"),
+        BotCommand("latest", "Get the latest phone news now"),
+        BotCommand("stop", "Unsubscribe from updates"),
+        BotCommand("help", "How to use this bot"),
     ]
     await application.bot.set_my_commands(commands)
 
-    # Schedule the news check to run every hour
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(
-            scheduled_check,
-            interval=3600,  # 1 hour in seconds
-            first=10        # Start after 10 seconds
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            broadcast_updates,
+            interval=UPDATE_INTERVAL,
+            first=60,  # Start after 60 seconds
         )
-        logger.info("Scheduled hourly news check.")
+        logger.info(f"Scheduled broadcast every {UPDATE_INTERVAL}s.")
     else:
-        logger.warning("JobQueue not available. Scheduled checks disabled.")
+        logger.warning("JobQueue unavailable — automatic updates disabled.")
 
 
 def main():
-    """Main entry point for Railway."""
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN environment variable not set")
+        raise ValueError("BOT_TOKEN environment variable is not set")
 
-    logger.info("Starting Phone Update Bot...")
+    logger.info("Starting Phone Update Bot (personal mode)...")
 
-    # Build application with post_init to set commands and scheduler
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    application = (
+        Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    )
 
-    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("latest", latest_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    # Run polling (Railway will keep this process alive 24/7)
     logger.info("Bot is running. Polling for updates...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
